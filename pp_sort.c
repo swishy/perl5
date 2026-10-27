@@ -654,6 +654,204 @@ sortsv_cmp_desc(pTHX_ gptr *base, size_t nmemb, U32 flags)
     sortsv_flags_impl(base, nmemb, S_cmp_desc, flags);
 }
 
+/* Decorated numeric sort for the non-overloaded built-in cases.
+ *
+ * The generic path pays for every comparison with random-access reads of
+ * two SV heads plus (for NVs) their out-of-line bodies, all through a
+ * function pointer. Here we instead make one O(n) sequential pass to
+ * extract each argument's numeric key, sort (key, sv) pairs with an
+ * inlined comparator, and write the permuted SV pointers back. This
+ * turns O(n log n) random memory traffic into O(n) of it.
+ *
+ * Behaviour is identical to the S_sv_ncmp / S_sv_i_ncmp comparators:
+ * pp_sort's pre-scan has already numified every argument once (with get
+ * magic applied), so extraction uses the same nomg accessors the
+ * comparators would, with the same caching side effects - just hoisted
+ * from "on first comparison" to "during extraction". Same-kind key pairs
+ * use the same arithmetic as do_ncmp(); mixed-kind pairs reproduce its
+ * IV/UV/NV conversion rules, including lossy integer-to-NV conversion.
+ * Anything we can't represent
+ * exactly - references, NaN operands, tiny lists - returns FALSE and the
+ * caller uses the existing comparator path. The merge is stable, like
+ * the existing mergesort.
+ */
+
+enum S_numkey_kind {
+    nkey_iv,
+    nkey_uv,
+    nkey_nv
+};
+
+struct S_numkey {
+    union {
+        IV iv;
+        UV uv;
+        NV nv;
+    } k;
+    SV *sv;
+    U8 kind;
+};
+
+/* With int_semantics, compare as S_sv_i_ncmp() would: both operands as
+ * plain IVs (a UV key is the same union bits read as IV). Otherwise use
+ * do_ncmp()'s integer/NV matrix. Mixed-kind pairs are resolved inline
+ * with the same arithmetic do_ncmp() uses - in particular an integer
+ * key against an NV key goes through the same (possibly lossy) NV
+ * conversion do_ncmp()'s NV path performs, so results and ties match it
+ * exactly. */
+
+PERL_STATIC_INLINE I32
+S_numkey_cmp(pTHX_ const struct S_numkey *ka, const struct S_numkey *kb,
+             bool int_semantics)
+{
+    if (int_semantics) {
+        const IV a = ka->kind == nkey_uv ? (IV)ka->k.uv : ka->k.iv;
+        const IV b = kb->kind == nkey_uv ? (IV)kb->k.uv : kb->k.iv;
+        return (a > b) - (a < b);
+    }
+    if (ka->kind == kb->kind) {
+        switch (ka->kind) {
+        case nkey_iv:
+            return (ka->k.iv > kb->k.iv) - (ka->k.iv < kb->k.iv);
+        case nkey_uv:
+            return (ka->k.uv > kb->k.uv) - (ka->k.uv < kb->k.uv);
+        default:
+            /* NaN keys never get this far */
+            return (ka->k.nv > kb->k.nv) - (ka->k.nv < kb->k.nv);
+        }
+    }
+    if (ka->kind != nkey_nv && kb->kind != nkey_nv) {
+        /* IV vs UV, as do_ncmp()'s integer matrix */
+        const struct S_numkey *ivk = ka->kind == nkey_iv ? ka : kb;
+        const struct S_numkey *uvk = ka->kind == nkey_uv ? ka : kb;
+        const IV iv = ivk->k.iv;
+        const UV uv = uvk->k.uv;
+        if (iv < 0)
+            return ivk == ka ? -1 : 1;
+        {
+            const int gt = (UV)iv > uv, lt = (UV)iv < uv;
+            return ivk == ka ? gt - lt : lt - gt;
+        }
+    }
+    else {
+        /* integer key vs NV key: both sides via NV, exactly as
+         * do_ncmp()'s NV path would convert them */
+        const struct S_numkey *nvk = ka->kind == nkey_nv ? ka : kb;
+        const struct S_numkey *ink = nvk == ka ? kb : ka;
+        const NV a = ink->kind == nkey_uv ? (NV)ink->k.uv : (NV)ink->k.iv;
+        const NV b = nvk->k.nv;
+        const int gt = a > b, lt = a < b;
+        return ink == ka ? gt - lt : lt - gt;
+    }
+}
+
+/* stable top-down mergesort over the decorated keys */
+static void
+S_numkey_mergesort(pTHX_ struct S_numkey *base, struct S_numkey *tmp,
+                   size_t nmemb, bool descending, bool int_semantics)
+{
+    const size_t half = nmemb / 2;
+    size_t i = 0, l = 0, r = half;
+    I32 c;
+
+    if (nmemb < 2)
+        return;
+
+    S_numkey_mergesort(aTHX_ base, tmp, half, descending, int_semantics);
+    S_numkey_mergesort(aTHX_ base + half, tmp, nmemb - half, descending,
+                       int_semantics);
+
+    c = S_numkey_cmp(aTHX_ &base[half - 1], &base[half], int_semantics);
+    if (descending) c = -c;
+    if (c <= 0)
+        return;                             /* halves already in order */
+
+    Copy(base, tmp, half, struct S_numkey);
+    while (l < half && r < nmemb) {
+        c = S_numkey_cmp(aTHX_ &tmp[l], &base[r], int_semantics);
+        if (descending) c = -c;
+        if (c <= 0)
+            base[i++] = tmp[l++];
+        else
+            base[i++] = base[r++];
+    }
+    while (l < half)
+        base[i++] = tmp[l++];
+    /* any remaining right-half entries are already in place */
+}
+
+/* Sort ary[0..nmemb) numerically if every element can be decorated with
+ * an exact key; returns FALSE (having sorted nothing) otherwise. */
+
+static bool
+S_sortsv_numeric_decorated(pTHX_ gptr *ary, size_t nmemb, bool descending,
+                           bool int_semantics)
+{
+    struct S_numkey *keys;
+    struct S_numkey *tmp;
+    size_t i;
+    bool ok = TRUE;
+
+    if (nmemb < 16)
+        return FALSE;
+
+    Newxz(keys, nmemb, struct S_numkey);
+    for (i = 0; i < nmemb; i++) {
+        SV *sv = (SV *)ary[i];
+
+        /* S_sv_ncmp() numifies references specially; leave those to it */
+        if (UNLIKELY(SvROK(sv))) { ok = FALSE; break; }
+
+        /* exactly what S_sv_ncmp() -> do_ncmp() does per comparison,
+         * hoisted out of the comparison loop */
+        (void)SvIV_please_nomg(sv);
+        if (SvIOK(sv)) {
+            if (SvIsUV(sv)) {
+                keys[i].k.uv = SvUVX(sv);
+                keys[i].kind = nkey_uv;
+            }
+            else {
+                keys[i].k.iv = SvIVX(sv);
+                keys[i].kind = nkey_iv;
+            }
+        }
+        else if (SvNOKp(sv)) {
+            const NV nv = SvNVX(sv);
+            if (UNLIKELY(Perl_isnan(nv))) { ok = FALSE; break; }
+            if (int_semantics) {
+                /* Fractional NVs can retain only private integer flags.
+                 * Compare converted IVs, never the NV union's raw bits. */
+                keys[i].k.iv = sv_2iv_flags(sv, 0);
+                keys[i].kind = nkey_iv;
+            }
+            else {
+                keys[i].k.nv = nv;
+                keys[i].kind = nkey_nv;
+            }
+        }
+        else {
+            /* e.g. undef: numeric uses of it must re-warn on every
+             * comparison, so it has to stay on the generic path */
+            ok = FALSE; break;
+        }
+        keys[i].sv = sv;
+    }
+
+    if (!ok) {
+        Safefree(keys);
+        return FALSE;
+    }
+
+    Newxz(tmp, (nmemb + 1) / 2, struct S_numkey);
+    S_numkey_mergesort(aTHX_ keys, tmp, nmemb, descending, int_semantics);
+    Safefree(tmp);
+
+    for (i = 0; i < nmemb; i++)
+        ary[i] = keys[i].sv;
+    Safefree(keys);
+    return TRUE;
+}
+
 #ifdef USE_LOCALE_COLLATE
 
 static void
@@ -1029,6 +1227,10 @@ PP(pp_sort)
                         else
                             sortsv_amagic_i_ncmp(aTHX_ start, max, sort_flags);
                     else
+                        if (S_sortsv_numeric_decorated(aTHX_ start, max,
+                                                       cBOOL(descending), TRUE))
+                            ;
+                        else
                         if (descending)
                             sortsv_i_ncmp_desc(aTHX_ start, max, sort_flags);
                         else
@@ -1041,6 +1243,10 @@ PP(pp_sort)
                         else
                             sortsv_amagic_ncmp(aTHX_ start, max, sort_flags);
                     else
+                        if (S_sortsv_numeric_decorated(aTHX_ start, max,
+                                                       cBOOL(descending), FALSE))
+                            ;
+                        else
                         if (descending)
                             sortsv_ncmp_desc(aTHX_ start, max, sort_flags);
                         else
