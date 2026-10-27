@@ -1110,6 +1110,14 @@ Perl_hv_common(pTHX_ HV *hv, SV *keysv, const char *key, STRLEN klen,
     xhv->xhv_keys++; /* HvTOTALKEYS(hv)++ */
     if ( in_collision && DO_HSPLIT(xhv) ) {
         const STRLEN oldsize = xhv->xhv_max + 1;
+        /* Downstream experiment: trade more spare bucket capacity for
+         * fewer relink passes in large hashes. This can increase RSS;
+         * retain separately from the numeric-sort optimization. */
+        const STRLEN newsize =
+            oldsize >= ((STRLEN)1 << 12)
+                && oldsize <= ((STRLEN)MAX_BUCKET_MAX + 1) / 4
+                ? oldsize * 4
+                : oldsize * 2;
         const U32 items = (U32)HvPLACEHOLDERS_get(hv);
 
         if (items /* hash has placeholders  */
@@ -1118,17 +1126,17 @@ Perl_hv_common(pTHX_ HV *hv, SV *keysv, const char *key, STRLEN klen,
                placeholders, but the "restricted" flag has been turned off,
                then the placeholders no longer serve any useful purpose.
                However, they have the downsides of taking up RAM, and adding
-               extra steps when finding used values. It's safe to clear them
+               extra steps when finding used keys. It's safe to clear them
                at this point, even though Storable rebuilds restricted hashes by
-               putting in all the placeholders (first) before turning on the
-               readonly flag, because Storable always pre-splits the hash.
+               putting in all the placeholders (first) before turning on
+               the readonly flag, because Storable always pre-splits the hash.
                If we're lucky, then we may clear sufficient placeholders to
                avoid needing to split the hash at all.  */
             clear_placeholders(hv, items);
             if (DO_HSPLIT(xhv))
-                hsplit(hv, oldsize, oldsize * 2);
+                hsplit(hv, oldsize, newsize);
         } else
-            hsplit(hv, oldsize, oldsize * 2);
+            hsplit(hv, oldsize, newsize);
     }
 
     if (return_svp) {
