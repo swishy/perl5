@@ -1,5 +1,8 @@
 Perl is Copyright (C) 1993 - 2026 by Larry Wall and others.
 
+Downstream performance branch: see Porting/downstream-performance.md for the patch set,
+build isolation, validation requirements and upstream integration approach.
+
 All rights reserved.
 
 # ABOUT PERL
