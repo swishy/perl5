@@ -6012,6 +6012,7 @@ Porting/corelist-diff				Tool to produce corelist diffs
 Porting/corelist-perldelta.pl			Generates data perldelta from Module::CoreList
 Porting/deparse-skips.txt			List of test files to ignore/skip for deparse tests.
 Porting/docs-team-charter.pod			Perl Documentation Team charter
+Porting/downstream-performance.md		Downstream blead performance build and maintenance notes
 Porting/epigraphs.pod				the release epigraphs used over the years
 Porting/exclude_contrib.txt			Data about contributors that do not want to be listed in AUTHORS
 Porting/exec-bit.txt				List of files that get +x in release tarball
@@ -6481,6 +6482,7 @@ t/op/gv.t				See if typeglobs work
 t/op/hash.t				See if the complexity attackers are repelled
 t/op/hash-clear-placeholders.t		Tests for corner cases in S_clear_placeholders
 t/op/hash-iteration-gh11157.t		See if hash iteration/deletion works
+t/op/hash_growth.t			Downstream large-hash growth regression tests
 t/op/hashassign.t			See if hash assignments work
 t/op/hashwarn.t				See if warnings for bad hash assignments work
 t/op/heredoc.t				See if heredoc edge and corner cases work
@@ -6570,6 +6572,7 @@ t/op/sleep.t				See if sleep works
 t/op/smartkve.t				See if smart deref for keys/values/each works
 t/op/smartmatch.t			See if the ~~ operator works
 t/op/sort.t				See if sort works
+t/op/sort_numeric_keys.t		Downstream numeric key-sort regression tests
 t/op/splice.t				See if splice works
 t/op/split.t				See if split works
 t/op/split_unicode.t			Test split /\s/ and Unicode

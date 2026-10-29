@@ -136,6 +136,11 @@ List of test files to ignore/skip for deparse tests.
 
 The charter of the Perl Documentation Team
 
+=head2 F<downstream-performance.md>
+
+Downstream blead performance patch set, build isolation, validation and
+maintenance approach for this fork.
+
 =head2 F<epigraphs.pod>
 
 List of Perl release epigraphs.
